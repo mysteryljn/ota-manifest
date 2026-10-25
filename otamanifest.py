@@ -7,6 +7,17 @@ import json
 import time
 from pathlib import Path
 
+
+_REQUIRED_MANIFEST_FIELDS = {
+    "schema",
+    "ecu",
+    "version",
+    "size",
+    "sha256",
+    "rollback_allowed",
+    "created_at",
+}
+
 def canonical(manifest):
     return json.dumps(manifest,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
 
@@ -17,6 +28,39 @@ def build_manifest(image,ecu,version,rollback=False):
 def sign_manifest(manifest,key):
     signature=hmac.new(key.encode(),canonical(manifest),hashlib.sha256).digest()
     return {"manifest":manifest,"algorithm":"HMAC-SHA256","signature":base64.b64encode(signature).decode()}
+
+
+def _valid_manifest(manifest):
+    """Return whether a manifest contains the complete v1 data model.
+
+    A valid HMAC only proves that the signer approved the bytes it signed.  It
+    does not make an incomplete manifest safe to consume.  Verifiers commonly
+    run without an image path first, so validate all fields before accepting a
+    signed manifest in that mode as well.
+    """
+    if manifest.get("schema") != "ota-manifest/v1":
+        return False
+    if not isinstance(manifest.get("ecu"), str) or not manifest["ecu"]:
+        return False
+    if not isinstance(manifest.get("version"), str) or not manifest["version"]:
+        return False
+
+    size = manifest.get("size")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return False
+
+    digest = manifest.get("sha256")
+    if (not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)):
+        return False
+
+    if not isinstance(manifest.get("rollback_allowed"), bool):
+        return False
+    created_at = manifest.get("created_at")
+    if isinstance(created_at, bool) or not isinstance(created_at, int) or created_at < 0:
+        return False
+    return _REQUIRED_MANIFEST_FIELDS.issubset(manifest)
 
 def verify_bundle(bundle,key,image=None):
     # Treat untrusted input as a verification failure rather than allowing a
@@ -31,12 +75,14 @@ def verify_bundle(bundle,key,image=None):
     try: actual=base64.b64decode(bundle["signature"],validate=True)
     except Exception: return False
     if not hmac.compare_digest(actual,expected): return False
+    manifest=bundle["manifest"]
+    if not _valid_manifest(manifest):
+        return False
     if image is None: return True
     try:
         data=image.read_bytes()
     except (OSError,TypeError):
         return False
-    manifest=bundle["manifest"]
     return (manifest.get("size") == len(data)
             and manifest.get("sha256") == hashlib.sha256(data).hexdigest())
 
@@ -48,6 +94,14 @@ def main(argv=None):
     if not args.command: parser.error("a command is required: sign or verify")
     if args.command=="sign":
         bundle=sign_manifest(build_manifest(args.image,args.ecu,args.version,args.rollback),args.key); args.output.write_text(json.dumps(bundle,indent=2,ensure_ascii=False)+"\n",encoding="utf-8"); print(f"signed {args.output}"); return 0
-    bundle=json.loads(args.manifest.read_text(encoding="utf-8")); ok=verify_bundle(bundle,args.key,args.image); print("OK" if ok else "INVALID"); return 0 if ok else 1
+    # Manifest files are untrusted input.  A truncated download, an invalid
+    # encoding, or a missing file must be reported as a verification failure
+    # instead of crashing the update orchestrator with a traceback.
+    try:
+        bundle=json.loads(args.manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        print("INVALID")
+        return 1
+    ok=verify_bundle(bundle,args.key,args.image); print("OK" if ok else "INVALID"); return 0 if ok else 1
 
 if __name__=="__main__": raise SystemExit(main())

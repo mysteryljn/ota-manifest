@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from otamanifest import build_manifest,sign_manifest,verify_bundle
+from otamanifest import build_manifest,main,sign_manifest,verify_bundle
 
 class OtaTests(unittest.TestCase):
     def test_sign_and_verify(self):
@@ -25,4 +25,37 @@ class OtaTests(unittest.TestCase):
         # KeyError/AttributeError that can take down an update verifier.
         self.assertFalse(verify_bundle({"algorithm": "HMAC-SHA256", "manifest": {}}, "secret"))
         self.assertFalse(verify_bundle([], "secret"))
+
+    def test_signed_manifest_requires_complete_metadata_without_image(self):
+        # A valid HMAC does not make an incomplete manifest safe to consume.
+        # Verification without an image still needs the fields used by an
+        # updater to select and describe the payload.
+        incomplete = {
+            "schema": "ota-manifest/v1",
+            "ecu": "ecu-a",
+            "version": "1.2.3",
+            "size": 8,
+            "sha256": "0" * 64,
+        }
+        self.assertFalse(verify_bundle(sign_manifest(incomplete, "secret"), "secret"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "image.bin"
+            image.write_bytes(b"firmware")
+            malformed = build_manifest(image, "ecu-a", "1.2.3")
+            malformed["size"] = -1
+            self.assertFalse(verify_bundle(sign_manifest(malformed, "secret"), "secret"))
+
+    def test_cli_rejects_unreadable_manifest_without_crashing(self):
+        # A partially written or corrupted manifest must fail closed so an OTA
+        # orchestrator can handle the failure and retry safely.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest=Path(tmp)/"manifest.json"
+            manifest.write_text("{not-json", encoding="utf-8")
+            self.assertEqual(main(["verify", str(manifest), "--key", "secret"]), 1)
+
+            manifest.write_bytes(b"\xff\xfe\x00")
+            self.assertEqual(main(["verify", str(manifest), "--key", "secret"]), 1)
+
+            self.assertEqual(main(["verify", str(Path(tmp)/"missing.json"), "--key", "secret"]), 1)
 if __name__=="__main__": unittest.main()
