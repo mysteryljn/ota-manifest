@@ -18,6 +18,8 @@ _REQUIRED_MANIFEST_FIELDS = {
     "created_at",
 }
 
+_HASH_CHUNK_SIZE = 1024 * 1024
+
 def canonical(manifest):
     return json.dumps(manifest,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
 
@@ -36,9 +38,23 @@ def _key_bytes(key):
     except UnicodeEncodeError as exc:
         raise ValueError("key must be valid UTF-8 text") from exc
 
+def _hash_image(image):
+    """Return ``(size, sha256)`` without loading the whole image in memory."""
+    digest=hashlib.sha256()
+    size=0
+    with image.open("rb") as stream:
+        while True:
+            chunk=stream.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    return size,digest.hexdigest()
+
+
 def build_manifest(image,ecu,version,rollback=False):
-    data=image.read_bytes()
-    return {"schema":"ota-manifest/v1","ecu":ecu,"version":version,"size":len(data),"sha256":hashlib.sha256(data).hexdigest(),"rollback_allowed":bool(rollback),"created_at":int(time.time())}
+    size,digest=_hash_image(image)
+    return {"schema":"ota-manifest/v1","ecu":ecu,"version":version,"size":size,"sha256":digest,"rollback_allowed":bool(rollback),"created_at":int(time.time())}
 
 def sign_manifest(manifest,key):
     signature=hmac.new(_key_bytes(key),canonical(manifest),hashlib.sha256).digest()
@@ -104,11 +120,10 @@ def verify_bundle(bundle,key,image=None):
         return False
     if image is None: return True
     try:
-        data=image.read_bytes()
+        size,digest=_hash_image(image)
     except (OSError,TypeError):
         return False
-    return (manifest.get("size") == len(data)
-            and manifest.get("sha256") == hashlib.sha256(data).hexdigest())
+    return manifest.get("size") == size and manifest.get("sha256") == digest
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description="Create or verify an OTA manifest"); sub=parser.add_subparsers(dest="command")
@@ -117,7 +132,17 @@ def main(argv=None):
     args=parser.parse_args(argv)
     if not args.command: parser.error("a command is required: sign or verify")
     if args.command=="sign":
-        bundle=sign_manifest(build_manifest(args.image,args.ecu,args.version,args.rollback),args.key); args.output.write_text(json.dumps(bundle,indent=2,ensure_ascii=False)+"\n",encoding="utf-8"); print(f"signed {args.output}"); return 0
+        # Image, key, and output paths are all caller-controlled.  A missing
+        # image or unwritable destination must be reported as a normal CLI
+        # failure so an OTA orchestrator can retry or abort cleanly instead
+        # of receiving an uncaught traceback.
+        try:
+            bundle=sign_manifest(build_manifest(args.image,args.ecu,args.version,args.rollback),args.key)
+            args.output.write_text(json.dumps(bundle,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            print(f"error: {exc}")
+            return 2
+        print(f"signed {args.output}"); return 0
     # Manifest files are untrusted input.  A truncated download, an invalid
     # encoding, or a missing file must be reported as a verification failure
     # instead of crashing the update orchestrator with a traceback.

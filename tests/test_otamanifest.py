@@ -3,6 +3,18 @@ import unittest
 from pathlib import Path
 from otamanifest import build_manifest,main,sign_manifest,verify_bundle
 
+
+class StreamingOnlyPath:
+    """Path wrapper that fails if the implementation reads all bytes at once."""
+    def __init__(self,path):
+        self.path=path
+
+    def open(self,*args,**kwargs):
+        return self.path.open(*args,**kwargs)
+
+    def read_bytes(self):
+        raise AssertionError("OTA hashing must stream the image")
+
 class OtaTests(unittest.TestCase):
     def test_sign_and_verify(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,4 +103,36 @@ class OtaTests(unittest.TestCase):
             self.assertEqual(main(["verify", str(manifest), "--key", "secret"]), 1)
 
             self.assertEqual(main(["verify", str(Path(tmp)/"missing.json"), "--key", "secret"]), 1)
+
+    def test_cli_sign_reports_io_and_key_errors_without_traceback(self):
+        # Signing is also an input/output boundary: a missing source image or
+        # invalid destination must return a controlled failure to automation.
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.bin"
+            output = Path(tmp) / "manifest.json"
+            self.assertEqual(main([
+                "sign", str(missing), str(output), "--version", "1.0", "--key", "secret"
+            ]), 2)
+
+            image = Path(tmp) / "image.bin"
+            image.write_bytes(b"firmware")
+            # The temporary directory itself is not a writable file target.
+            self.assertEqual(main([
+                "sign", str(image), tmp, "--version", "1.0", "--key", "secret"
+            ]), 2)
+
+            self.assertEqual(main([
+                "sign", str(image), str(output), "--version", "1.0", "--key", ""
+            ]), 2)
+
+    def test_image_hashing_is_streamed(self):
+        # Firmware can be hundreds of megabytes.  Both signing and payload
+        # verification must hash it in bounded chunks instead of calling
+        # Path.read_bytes(), which would allocate the complete image.
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/"large-image.bin"
+            image.write_bytes(b"A" * (2 * 1024 * 1024 + 17))
+            streamed=StreamingOnlyPath(image)
+            bundle=sign_manifest(build_manifest(streamed,"ecu-a","1.2.3"),"secret")
+            self.assertTrue(verify_bundle(bundle,"secret",streamed))
 if __name__=="__main__": unittest.main()
