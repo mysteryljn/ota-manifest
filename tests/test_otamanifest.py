@@ -13,6 +13,18 @@ class OtaTests(unittest.TestCase):
             image.write_bytes(b"tampered")
             self.assertFalse(verify_bundle(bundle,"secret",image))
 
+    def test_empty_hmac_key_is_rejected(self):
+        # HMAC accepts an empty key, but that makes the signature reproducible
+        # by any attacker and therefore turns verification into no protection.
+        with self.assertRaises(ValueError):
+            sign_manifest({"payload": "test"}, "")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image=Path(tmp)/"image.bin"; image.write_bytes(b"firmware")
+            bundle=sign_manifest(build_manifest(image,"ecu-a","1.2.3"),"secret")
+            self.assertFalse(verify_bundle(bundle, ""))
+            self.assertFalse(verify_bundle(bundle, None))
+
     def test_payload_verification_rejects_missing_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             image=Path(tmp)/"image.bin"; image.write_bytes(b"firmware")
@@ -25,6 +37,27 @@ class OtaTests(unittest.TestCase):
         # KeyError/AttributeError that can take down an update verifier.
         self.assertFalse(verify_bundle({"algorithm": "HMAC-SHA256", "manifest": {}}, "secret"))
         self.assertFalse(verify_bundle([], "secret"))
+
+    def test_manifest_with_invalid_unicode_is_rejected_without_exception(self):
+        # JSON allows escaped lone surrogates, while UTF-8 encoding the
+        # canonical form does not.  Untrusted input must fail closed rather
+        # than taking down the OTA verifier with UnicodeEncodeError.
+        manifest = {
+            "schema": "ota-manifest/v1",
+            "ecu": "ecu-a",
+            "version": "1.2.3",
+            "size": 0,
+            "sha256": "0" * 64,
+            "rollback_allowed": False,
+            "created_at": 0,
+            "description": "\ud800",
+        }
+        bundle = {
+            "algorithm": "HMAC-SHA256",
+            "manifest": manifest,
+            "signature": "",
+        }
+        self.assertFalse(verify_bundle(bundle, "secret"))
 
     def test_signed_manifest_requires_complete_metadata_without_image(self):
         # A valid HMAC does not make an incomplete manifest safe to consume.

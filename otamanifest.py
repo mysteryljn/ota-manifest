@@ -21,12 +21,27 @@ _REQUIRED_MANIFEST_FIELDS = {
 def canonical(manifest):
     return json.dumps(manifest,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
 
+def _key_bytes(key):
+    """Return key material only when a real shared secret was supplied.
+
+    An empty HMAC key is accepted by the standard library, but it provides no
+    authentication: anyone can reproduce a signature with ``--key ""``.
+    Keep this check in one place so both signing and verification apply the
+    same policy.
+    """
+    if not isinstance(key, str) or not key:
+        raise ValueError("key must be a non-empty string")
+    try:
+        return key.encode()
+    except UnicodeEncodeError as exc:
+        raise ValueError("key must be valid UTF-8 text") from exc
+
 def build_manifest(image,ecu,version,rollback=False):
     data=image.read_bytes()
     return {"schema":"ota-manifest/v1","ecu":ecu,"version":version,"size":len(data),"sha256":hashlib.sha256(data).hexdigest(),"rollback_allowed":bool(rollback),"created_at":int(time.time())}
 
 def sign_manifest(manifest,key):
-    signature=hmac.new(key.encode(),canonical(manifest),hashlib.sha256).digest()
+    signature=hmac.new(_key_bytes(key),canonical(manifest),hashlib.sha256).digest()
     return {"manifest":manifest,"algorithm":"HMAC-SHA256","signature":base64.b64encode(signature).decode()}
 
 
@@ -71,7 +86,16 @@ def verify_bundle(bundle,key,image=None):
             or not isinstance(bundle.get("manifest"), dict)
             or not isinstance(bundle.get("signature"), str)):
         return False
-    expected=hmac.new(key.encode(),canonical(bundle["manifest"]),hashlib.sha256).digest()
+    # JSON permits escaped lone surrogates (for example ``"\ud800"``), but
+    # those values cannot be encoded as UTF-8 by ``canonical``.  A manifest
+    # comes from an untrusted update channel, so treat this as a failed
+    # verification instead of allowing UnicodeEncodeError to crash the
+    # updater process.
+    try:
+        key_material = _key_bytes(key)
+        expected=hmac.new(key_material,canonical(bundle["manifest"]),hashlib.sha256).digest()
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return False
     try: actual=base64.b64decode(bundle["signature"],validate=True)
     except Exception: return False
     if not hmac.compare_digest(actual,expected): return False
