@@ -37,6 +37,31 @@ class OtaTests(unittest.TestCase):
             self.assertFalse(verify_bundle(bundle, ""))
             self.assertFalse(verify_bundle(bundle, None))
 
+    def test_blank_identity_metadata_is_rejected(self):
+        # A signed update must identify both its target ECU and release.  A
+        # whitespace-only value otherwise passes a truthiness check and can
+        # reach an updater with unusable routing/version metadata.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "image.bin"
+            image.write_bytes(b"firmware")
+            for field in ("ecu", "version"):
+                with self.subTest(field=field):
+                    kwargs = {"ecu": "ecu-a", "version": "1.2.3"}
+                    kwargs[field] = "   "
+                    with self.assertRaises(ValueError):
+                        build_manifest(image, kwargs["ecu"], kwargs["version"])
+
+            malformed = {
+                "schema": "ota-manifest/v1",
+                "ecu": "   ",
+                "version": "1.2.3",
+                "size": 8,
+                "sha256": "0" * 64,
+                "rollback_allowed": False,
+                "created_at": 0,
+            }
+            self.assertFalse(verify_bundle(sign_manifest(malformed, "secret"), "secret"))
+
     def test_payload_verification_rejects_missing_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             image=Path(tmp)/"image.bin"; image.write_bytes(b"firmware")
@@ -135,4 +160,14 @@ class OtaTests(unittest.TestCase):
             streamed=StreamingOnlyPath(image)
             bundle=sign_manifest(build_manifest(streamed,"ecu-a","1.2.3"),"secret")
             self.assertTrue(verify_bundle(bundle,"secret",streamed))
+
+    def test_cli_rejects_deeply_nested_manifest_without_traceback(self):
+        # ``json.loads`` can raise RecursionError on a maliciously deep
+        # manifest before verification starts.  The OTA command must fail
+        # closed with its normal invalid-manifest status.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "deep.json"
+            manifest.write_text("[" * 2000 + "0" + "]" * 2000, encoding="utf-8")
+            self.assertEqual(main(["verify", str(manifest), "--key", "secret"]), 1)
+
 if __name__=="__main__": unittest.main()

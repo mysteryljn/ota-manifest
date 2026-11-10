@@ -53,6 +53,10 @@ def _hash_image(image):
 
 
 def build_manifest(image,ecu,version,rollback=False):
+    if not isinstance(ecu, str) or not ecu.strip():
+        raise ValueError("ecu must be non-empty text")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("version must be non-empty text")
     size,digest=_hash_image(image)
     return {"schema":"ota-manifest/v1","ecu":ecu,"version":version,"size":size,"sha256":digest,"rollback_allowed":bool(rollback),"created_at":int(time.time())}
 
@@ -71,9 +75,9 @@ def _valid_manifest(manifest):
     """
     if manifest.get("schema") != "ota-manifest/v1":
         return False
-    if not isinstance(manifest.get("ecu"), str) or not manifest["ecu"]:
+    if not isinstance(manifest.get("ecu"), str) or not manifest["ecu"].strip():
         return False
-    if not isinstance(manifest.get("version"), str) or not manifest["version"]:
+    if not isinstance(manifest.get("version"), str) or not manifest["version"].strip():
         return False
 
     size = manifest.get("size")
@@ -148,7 +152,11 @@ def main(argv=None):
     # instead of crashing the update orchestrator with a traceback.
     try:
         bundle=json.loads(args.manifest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+    # The JSON decoder raises RecursionError for attacker-controlled deeply
+    # nested input before verification can fail closed.  Treat that malformed
+    # manifest like any other unreadable/invalid file instead of leaking a
+    # traceback from the OTA verifier.
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, RecursionError):
         print("INVALID")
         return 1
     ok=verify_bundle(bundle,args.key,args.image); print("OK" if ok else "INVALID"); return 0 if ok else 1
